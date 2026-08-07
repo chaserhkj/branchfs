@@ -1,0 +1,38 @@
+src/fs_helpers.rs
+  s_56292264055d09::t_3b2016b620c40c 42,44-50
+  h_8d23b84102cdcd 43
+src/fs.rs
+  s_56292264055d09::t_1e033bed93b2b4 1716
+  s_56292264055d09::t_c9098a159d1452 1852
+  s_56292264055d09::t_2dc93300430ae1 985,1020
+  h_8d23b84102cdcd 1293
+  s_56292264055d09::t_7e1e8a8608e246 1687
+  s_56292264055d09::t_df4a596cf3f8d4 1824
+tests/test_file_operations.sh
+  h_8d23b84102cdcd 247
+  s_56292264055d09::t_e56624fd19b046 237-244,251-296
+  s_56292264055d09::t_4d045eae3d030d 246,248-250
+  s_56292264055d09::t_dae99146090e9b 310-313
+  s_56292264055d09::t_e5d185acffe06f 245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "edf83284728f87388405c7c5be88cc52e641207a",
+  "prompts": {},
+  "humans": {
+    "h_8d23b84102cdcd": {
+      "author": "Chaser Huang <huangkangjing@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_56292264055d09": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fd929-e6fb-7157-a0dc-bb88981dced4",
+        "model": "deepseek-v4-flash-0731"
+      },
+      "human_author": "Chaser Huang <huangkangjing@gmail.com>"
+    }
+  }
+}
