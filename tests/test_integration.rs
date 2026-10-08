@@ -917,6 +917,77 @@ fn test_commit_deletion_visible_at_mount_root() {
     );
 }
 
+/// Regression: `rmdir` must return ENOTEMPTY for a directory that still has
+/// visible children, and must not tombstone it. Removal tools probe upward
+/// through parents and rely on ENOTEMPTY to stop climbing; without it they
+/// tombstone non-empty ancestors, hiding subtrees from the branch and
+/// replaying as a recursive delete of the base on commit.
+#[test]
+#[ignore]
+fn test_rmdir_refuses_nonempty_directory_and_preserves_subtree() {
+    let fix = TestFixture::new("rmdir_nonempty");
+    fs::create_dir_all(fix.base.join("a/b/c")).unwrap();
+    fs::write(fix.base.join("a/keep"), "keep\n").unwrap();
+    fs::write(fix.base.join("a/b/keep"), "keep\n").unwrap();
+    fs::write(fix.base.join("a/b/c/target"), "target\n").unwrap();
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Remove the leaf file, then remove the now-empty directory.
+    fs::remove_file(bdir.join("a/b/c/target")).unwrap();
+    fs::remove_dir(bdir.join("a/b/c")).expect("a/b/c is empty and removable");
+
+    // `a/b` and `a` still contain visible children.
+    let err = fs::remove_dir(bdir.join("a/b")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY));
+    let err = fs::remove_dir(bdir.join("a")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY));
+
+    // The surviving subtree must still resolve through the branch.
+    assert_eq!(fs::read_to_string(bdir.join("a/keep")).unwrap(), "keep\n");
+    assert_eq!(fs::read_to_string(bdir.join("a/b/keep")).unwrap(), "keep\n");
+    let entries: Vec<String> = fs::read_dir(&bdir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.contains(&"a".to_string()),
+        "non-empty ancestor must stay visible; got: {:?}",
+        entries
+    );
+
+    // Committing must not remove `a` from the base.
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+    assert!(fix.base.join("a").exists(), "`a` must survive in the base");
+    assert_eq!(
+        fs::read_to_string(fix.base.join("a/keep")).unwrap(),
+        "keep\n"
+    );
+    assert!(!fix.base.join("a/b/c").exists(), "emptied dir is deleted");
+}
+
+/// `unlink` on a directory must fail with EISDIR rather than tombstoning it.
+#[test]
+#[ignore]
+fn test_unlink_directory_returns_eisdir() {
+    let fix = TestFixture::new("unlink_dir");
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    let err = fs::remove_file(bdir.join("subdir")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+    assert!(bdir.join("subdir/nested.txt").exists());
+}
+
 /// Modifying a base file (not main's delta) in a branch and committing
 /// should update the file visible at the mount root.
 #[test]
