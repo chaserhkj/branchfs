@@ -272,6 +272,148 @@ impl BranchFs {
         let path = self.inodes.get_path(ino)?;
         Some(classify_path(&path))
     }
+
+    /// Shared body of `unlink` and `rmdir`. `want_dir` selects the POSIX
+    /// rule: `unlink` rejects a directory with EISDIR, `rmdir` rejects a
+    /// missing path with ENOENT and a directory with visible children with
+    /// ENOTEMPTY. Only a genuinely empty directory is tombstoned.
+    fn remove_common(&mut self, parent: u64, name: &OsStr, want_dir: bool, reply: ReplyEmpty) {
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy();
+
+        let branch_ctx = match classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
+
+        if let Some((branch, parent_rel)) = branch_ctx {
+            // Can't unlink @child dirs or .branchfs_ctl
+            if name_str.starts_with('@') || *name_str == *CTL_FILE {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let resolved = self.manager.resolve_path(&branch, &rel_path).ok().flatten();
+            if !want_dir {
+                if resolved
+                    .as_ref()
+                    .and_then(|p| p.symlink_metadata().ok())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    reply.error(libc::EISDIR);
+                    return;
+                }
+            } else if resolved.is_none() {
+                reply.error(libc::ENOENT);
+                return;
+            } else if !self.branch_dir_is_empty(&branch, &rel_path) {
+                reply.error(libc::ENOTEMPTY);
+                return;
+            }
+            let result = self.manager.with_branch(&branch, |b| {
+                b.add_tombstone(&rel_path)?;
+                let delta = b.delta_path(&rel_path);
+                if delta.exists() {
+                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
+                    std::fs::remove_file(&delta)?;
+                    self.manager.quota.sub(freed);
+                }
+                Ok(())
+            });
+
+            if result.is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+
+            let inode_path = format!("/@{}{}", branch, rel_path);
+            self.inodes.remove(&inode_path);
+            reply.ok();
+        } else {
+            // Root-path unlink (or EPERM for ctl files)
+            match classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let branch = self.get_branch_name();
+                    let resolved = self.manager.resolve_path(&branch, &path).ok().flatten();
+                    if !want_dir {
+                        if resolved
+                            .as_ref()
+                            .and_then(|p| p.symlink_metadata().ok())
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                        {
+                            reply.error(libc::EISDIR);
+                            return;
+                        }
+                    } else if resolved.is_none() {
+                        reply.error(libc::ENOENT);
+                        return;
+                    } else if !self.branch_dir_is_empty(&branch, &path) {
+                        reply.error(libc::ENOTEMPTY);
+                        return;
+                    }
+
+                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
+                        b.add_tombstone(&path)?;
+                        let delta = b.delta_path(&path);
+                        if delta.exists() {
+                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
+                            std::fs::remove_file(&delta)?;
+                            self.manager.quota.sub(freed);
+                        }
+                        Ok(())
+                    });
+
+                    if result.is_err() || self.is_stale() {
+                        reply.error(libc::ESTALE);
+                        return;
+                    }
+
+                    self.inodes.remove(&path);
+                    reply.ok();
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            }
+        }
+    }
+
+    /// Whether the directory at `rel_path` reports no visible children.
+    fn branch_dir_is_empty(&self, branch: &str, rel_path: &str) -> bool {
+        self.collect_readdir_entries(branch, rel_path, 0, "")
+            .iter()
+            .all(|(_, _, name)| name == "." || name == "..")
+    }
 }
 
 impl Filesystem for BranchFs {
@@ -1039,100 +1181,11 @@ impl Filesystem for BranchFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.inodes.get_path(parent) {
-            Some(p) => p,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let name_str = name.to_string_lossy();
-
-        let branch_ctx = match classify_path(&parent_path) {
-            PathContext::BranchDir(b) => Some((b, "/".to_string())),
-            PathContext::BranchPath(b, rel) => Some((b, rel)),
-            _ => None,
-        };
-
-        if let Some((branch, parent_rel)) = branch_ctx {
-            // Can't unlink @child dirs or .branchfs_ctl
-            if name_str.starts_with('@') || *name_str == *CTL_FILE {
-                reply.error(libc::EPERM);
-                return;
-            }
-
-            if !self.manager.is_branch_valid(&branch) {
-                reply.error(libc::ENOENT);
-                return;
-            }
-
-            let rel_path = if parent_rel == "/" {
-                format!("/{}", name_str)
-            } else {
-                format!("{}/{}", parent_rel, name_str)
-            };
-
-            let result = self.manager.with_branch(&branch, |b| {
-                b.add_tombstone(&rel_path)?;
-                let delta = b.delta_path(&rel_path);
-                if delta.exists() {
-                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                    std::fs::remove_file(&delta)?;
-                    self.manager.quota.sub(freed);
-                }
-                Ok(())
-            });
-
-            if result.is_err() {
-                reply.error(libc::EIO);
-                return;
-            }
-
-            let inode_path = format!("/@{}{}", branch, rel_path);
-            self.inodes.remove(&inode_path);
-            reply.ok();
-        } else {
-            // Root-path unlink (or EPERM for ctl files)
-            match classify_path(&parent_path) {
-                PathContext::BranchCtl(_) | PathContext::RootCtl => {
-                    reply.error(libc::EPERM);
-                }
-                PathContext::RootPath(rp) => {
-                    let path = if rp == "/" {
-                        format!("/{}", name_str)
-                    } else {
-                        format!("{}/{}", rp, name_str)
-                    };
-
-                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
-                        b.add_tombstone(&path)?;
-                        let delta = b.delta_path(&path);
-                        if delta.exists() {
-                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                            std::fs::remove_file(&delta)?;
-                            self.manager.quota.sub(freed);
-                        }
-                        Ok(())
-                    });
-
-                    if result.is_err() || self.is_stale() {
-                        reply.error(libc::ESTALE);
-                        return;
-                    }
-
-                    self.inodes.remove(&path);
-                    reply.ok();
-                }
-                _ => {
-                    reply.error(libc::ENOENT);
-                }
-            }
-        }
+        self.remove_common(parent, name, false, reply);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(_req, parent, name, reply);
+        self.remove_common(parent, name, true, reply);
     }
 
     fn rename(
