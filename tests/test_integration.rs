@@ -988,6 +988,44 @@ fn test_unlink_directory_returns_eisdir() {
     assert!(bdir.join("subdir/nested.txt").exists());
 }
 
+/// Regression: `rmdir` of a freshly created empty directory must succeed.
+/// The branch delta stores a directory as a real directory, so tombstoning it
+/// must remove that entry with a directory-aware primitive. A plain unlink
+/// fails with EISDIR, which surfaced as EIO on a branch path and ENOENT on a
+/// root path even though the tombstone had already been recorded.
+#[test]
+#[ignore]
+fn test_rmdir_fresh_directory_succeeds() {
+    let fix = TestFixture::new("rmdir_fresh");
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Fresh directory through the mount root (root-path arm of remove_common).
+    fs::create_dir(fix.mnt.join("root_fresh")).unwrap();
+    fs::remove_dir(fix.mnt.join("root_fresh"))
+        .expect("rmdir of a fresh root directory must succeed");
+    assert!(!fix.mnt.join("root_fresh").exists());
+
+    // Fresh directory inside the branch (branch-path arm).
+    fs::create_dir(bdir.join("branch_fresh")).unwrap();
+    fs::remove_dir(bdir.join("branch_fresh"))
+        .expect("rmdir of a fresh branch directory must succeed");
+    assert!(!bdir.join("branch_fresh").exists());
+
+    // Nested: remove the emptied leaf, then its parent.
+    fs::create_dir_all(bdir.join("nested/inner")).unwrap();
+    fs::remove_dir(bdir.join("nested/inner")).expect("rmdir of fresh nested leaf");
+    fs::remove_dir(bdir.join("nested")).expect("rmdir of emptied parent");
+    assert!(!bdir.join("nested").exists());
+
+    // The recreated name must be usable again (tombstone revival).
+    fs::create_dir(bdir.join("branch_fresh")).unwrap();
+    assert!(bdir.join("branch_fresh").is_dir());
+}
+
 /// Modifying a base file (not main's delta) in a branch and committing
 /// should update the file visible at the mount root.
 #[test]

@@ -332,12 +332,8 @@ impl BranchFs {
             }
             let result = self.manager.with_branch(&branch, |b| {
                 b.add_tombstone(&rel_path)?;
-                let delta = b.delta_path(&rel_path);
-                if delta.exists() {
-                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                    std::fs::remove_file(&delta)?;
-                    self.manager.quota.sub(freed);
-                }
+                let freed = Self::remove_delta_entry(&b.delta_path(&rel_path))?;
+                self.manager.quota.sub(freed);
                 Ok(())
             });
 
@@ -384,12 +380,8 @@ impl BranchFs {
 
                     let result = self.manager.with_branch(&self.get_branch_name(), |b| {
                         b.add_tombstone(&path)?;
-                        let delta = b.delta_path(&path);
-                        if delta.exists() {
-                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                            std::fs::remove_file(&delta)?;
-                            self.manager.quota.sub(freed);
-                        }
+                        let freed = Self::remove_delta_entry(&b.delta_path(&path))?;
+                        self.manager.quota.sub(freed);
                         Ok(())
                     });
 
@@ -413,6 +405,46 @@ impl BranchFs {
         self.collect_readdir_entries(branch, rel_path, 0, "")
             .iter()
             .all(|(_, _, name)| name == "." || name == "..")
+    }
+
+    /// A directory delta is stored as a real directory, so it must be removed
+    /// with a directory-aware primitive; a plain unlink fails with EISDIR.
+    /// A missing path releases nothing.
+    fn remove_delta_entry(path: &Path) -> std::io::Result<u64> {
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_dir() {
+            let freed = Self::dir_file_bytes(path);
+            std::fs::remove_dir_all(path)?;
+            Ok(freed)
+        } else {
+            let freed = meta.len();
+            std::fs::remove_file(path)?;
+            Ok(freed)
+        }
+    }
+
+    /// Total size of regular files under `path`, used to release quota once a
+    /// directory delta is removed. Directory inode sizes are not counted, so
+    /// this mirrors how writes add to the quota.
+    fn dir_file_bytes(path: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if let Ok(m) = child.symlink_metadata() {
+                    if m.file_type().is_dir() {
+                        total += Self::dir_file_bytes(&child);
+                    } else {
+                        total += m.len();
+                    }
+                }
+            }
+        }
+        total
     }
 }
 
@@ -2033,6 +2065,54 @@ mod tests {
         assert!(
             fs.is_stale(),
             "a foreign abort must make the mount stale via branch removal"
+        );
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("branchfs-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn remove_delta_entry_removes_directory_and_reports_file_bytes() {
+        let root = temp_dir("delta-dir");
+        let dir = root.join("tree");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner/a"), b"abcd").unwrap();
+        std::fs::write(dir.join("b"), b"ef").unwrap();
+
+        let freed = BranchFs::remove_delta_entry(&dir).unwrap();
+        assert!(
+            !dir.exists(),
+            "a directory delta must be removed with a directory-aware primitive"
+        );
+        assert_eq!(
+            freed, 6,
+            "regular file bytes under the directory are released"
+        );
+    }
+
+    #[test]
+    fn remove_delta_entry_removes_file_and_symlink() {
+        let root = temp_dir("delta-file");
+        let file = root.join("f");
+        std::fs::write(&file, b"12345").unwrap();
+        assert_eq!(BranchFs::remove_delta_entry(&file).unwrap(), 5);
+        assert!(!file.exists());
+
+        let link = root.join("l");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        assert_eq!(BranchFs::remove_delta_entry(&link).unwrap(), 6);
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn remove_delta_entry_missing_path_releases_nothing() {
+        let root = temp_dir("delta-missing");
+        assert_eq!(
+            BranchFs::remove_delta_entry(&root.join("absent")).unwrap(),
+            0
         );
     }
 }

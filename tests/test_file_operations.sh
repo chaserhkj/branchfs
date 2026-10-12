@@ -260,10 +260,56 @@ test_recreate_dir_after_delete() {
     do_mount
     mkdir "$TEST_MNT/recreate_dir"
     assert "[[ -d '$TEST_MNT/recreate_dir' ]]" "Directory created"
-    rmdir "$TEST_MNT/recreate_dir"
+    assert "rmdir '$TEST_MNT/recreate_dir'" "rmdir of empty directory succeeds"
     assert "[[ ! -d '$TEST_MNT/recreate_dir' ]]" "Directory deleted"
     mkdir "$TEST_MNT/recreate_dir"
     assert "[[ -d '$TEST_MNT/recreate_dir' ]]" "Directory recreated with same name"
+    do_unmount
+}
+
+# Regression: rmdir on a freshly created empty directory must succeed. The
+# delta stores a directory as a real directory, so tombstoning it must remove
+# that entry with a directory-aware primitive; a plain unlink fails with EISDIR
+# and surfaced as EIO (branch path) or ENOENT (root path).
+test_rmdir_fresh_directory_succeeds() {
+    setup
+    do_mount
+    do_create "rmdir_fresh" "main"
+
+    mkdir "$TEST_MNT/root_fresh"
+    assert "rmdir '$TEST_MNT/root_fresh'" "rmdir of fresh root directory succeeds"
+    assert "[[ ! -e '$TEST_MNT/root_fresh' ]]" "fresh root directory removed"
+
+    mkdir "$TEST_MNT/@rmdir_fresh/branch_fresh"
+    assert "rmdir '$TEST_MNT/@rmdir_fresh/branch_fresh'" \
+        "rmdir of fresh branch directory succeeds"
+    assert "[[ ! -e '$TEST_MNT/@rmdir_fresh/branch_fresh' ]]" \
+        "fresh branch directory removed"
+
+    mkdir -p "$TEST_MNT/@rmdir_fresh/nested/inner"
+    assert "rmdir '$TEST_MNT/@rmdir_fresh/nested/inner'" \
+        "rmdir of fresh nested directory succeeds"
+    assert "rmdir '$TEST_MNT/@rmdir_fresh/nested'" \
+        "rmdir of emptied parent directory succeeds"
+
+    do_unmount
+}
+
+# Removing an emptied branch directory must also recreate cleanly, exercising
+# the join of rmdir delta cleanup and the tombstone revival on mkdir.
+test_recreate_dir_after_delete_in_branch() {
+    setup
+    do_mount
+    do_create "recreate_dir_b" "main"
+
+    mkdir "$TEST_MNT/@recreate_dir_b/dir"
+    assert "rmdir '$TEST_MNT/@recreate_dir_b/dir'" "branch directory removed"
+    assert "[[ ! -e '$TEST_MNT/@recreate_dir_b/dir' ]]" "branch directory gone"
+
+    mkdir "$TEST_MNT/@recreate_dir_b/dir"
+    assert "[[ -d '$TEST_MNT/@recreate_dir_b/dir' ]]" \
+        "branch directory recreated with same name"
+
     do_unmount
 }
 
@@ -309,6 +355,9 @@ run_test "Chmod Existing File (COW)" test_chmod_existing_file_cow
 run_test "Synthetic Entry Ownership" test_synthetic_entry_ownership
 run_test "Recreate File After Delete" test_recreate_file_after_delete
 run_test "Recreate Dir After Delete" test_recreate_dir_after_delete
+
+run_test "Rmdir Fresh Directory Succeeds" test_rmdir_fresh_directory_succeeds
+run_test "Recreate Dir After Delete in Branch" test_recreate_dir_after_delete_in_branch
 run_test "Recreate Symlink After Delete" test_recreate_symlink_after_delete
 run_test "Recreate File After Delete in Branch" test_recreate_file_after_delete_in_branch
 
